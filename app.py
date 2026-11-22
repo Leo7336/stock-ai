@@ -44,7 +44,7 @@ if "ai_reports" not in st.session_state:
 
 
 # ---------------------------------------------------------
-# 1. 侧边栏：多服务商与多模型配置
+# 1. 侧边栏：AI 模型配置 + 可选备选行情 API（Finnhub）
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("AI 模型与 API 配置")
@@ -104,6 +104,19 @@ with st.sidebar:
         else:
             model_name = selected_deepseek
         st.caption("DeepSeek 走 OpenAI 兼容接口，需确保账户有可用 API 额度。")
+
+    st.divider()
+    st.subheader("可选：备选行情 API")
+    data_source_mode = st.selectbox(
+        "行情抓取策略",
+        options=["yfinance 优先 + Finnhub 补缺", "仅用 yfinance"],
+        index=0,
+    )
+    finnhub_key = st.text_input(
+        "Finnhub API Key（可选，主要补美股报价）",
+        type="password",
+        placeholder="留空则仅用 yfinance",
+    )
 
     st.divider()
     st.caption(
@@ -216,7 +229,7 @@ def search_companies_by_keyword(keyword: str, max_results: int = 8) -> tuple[lis
 
 
 # ---------------------------------------------------------
-# 3. 股票代码解析、行情指标与排雷计算
+# 3. 股票代码解析、多源行情指标与排雷计算
 # ---------------------------------------------------------
 def parse_tickers(raw_text: str, max_count: int = 10) -> list[str]:
     parts = [t.strip().upper() for t in raw_text.replace("\n", ",").split(",")]
@@ -236,7 +249,28 @@ def append_tickers_to_input(new_symbols: list[str]) -> None:
     st.session_state["tickers_input"] = ", ".join(current_list[:10])
 
 
-def fetch_stock_metrics(ticker: str) -> dict:
+def _fetch_finnhub_quote(ticker: str, token: str) -> dict:
+    """用 Finnhub /quote 拉取补充报价（主要用于无点号的美股 ticker）。"""
+    clean_token = (token or "").strip()
+    if not clean_token or "." in ticker:
+        return {}
+    url = (
+        f"https://finnhub.io/api/v1/quote?symbol={urllib.parse.quote(ticker)}"
+        f"&token={urllib.parse.quote(clean_token)}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict) or not data.get("c"):
+        return {}
+    return {
+        "current_price": data.get("c"),
+        "high_52w": data.get("h"),
+        "low_52w": data.get("l"),
+    }
+
+
+def fetch_stock_metrics(ticker: str, use_finnhub: bool = False, finnhub_token: str = "") -> dict:
     stock = yf.Ticker(ticker)
     info = stock.info or {}
     hist = stock.history(period="1y")
@@ -260,6 +294,21 @@ def fetch_stock_metrics(ticker: str) -> dict:
             high_52w = float(hist["High"].max())
         if low_52w is None:
             low_52w = float(hist["Low"].min())
+
+    source_tag = "yfinance"
+    if use_finnhub and finnhub_token and (current_price is None or high_52w is None or low_52w is None):
+        try:
+            fh = _fetch_finnhub_quote(ticker, finnhub_token)
+            if fh:
+                if current_price is None and fh.get("current_price") is not None:
+                    current_price = float(fh["current_price"])
+                if high_52w is None and fh.get("high_52w") is not None:
+                    high_52w = float(fh["high_52w"])
+                if low_52w is None and fh.get("low_52w") is not None:
+                    low_52w = float(fh["low_52w"])
+                source_tag = "yfinance+Finnhub"
+        except Exception:
+            pass
 
     drawdown_from_high_pct = None
     if current_price is not None and high_52w and high_52w > 0:
@@ -291,6 +340,7 @@ def fetch_stock_metrics(ticker: str) -> dict:
         "负债权益比": round(float(debt_to_equity), 1) if debt_to_equity is not None else None,
         "自由现金流": free_cashflow,
         "市值": market_cap,
+        "数据源": source_tag,
         "硬规则排雷": "；".join(red_flags) if red_flags else "无明显硬规则红灯",
     }
 
@@ -410,6 +460,7 @@ if start_btn:
         st.error("请至少输入 1 只有效的股票代码。")
         st.stop()
 
+    use_fh = data_source_mode == "yfinance 优先 + Finnhub 补缺"
     overview_rows = []
     valid_metrics = []
 
@@ -424,7 +475,11 @@ if start_btn:
                 text=f"正在拉取指标 ({idx + 1}/{len(tickers)})：{ticker}",
             )
             try:
-                metrics = fetch_stock_metrics(ticker)
+                metrics = fetch_stock_metrics(
+                    ticker,
+                    use_finnhub=use_fh,
+                    finnhub_token=finnhub_key,
+                )
                 overview_rows.append(metrics)
                 valid_metrics.append(metrics)
             except Exception as e:
