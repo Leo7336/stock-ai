@@ -44,16 +44,18 @@ if "ai_reports" not in st.session_state:
 
 
 # ---------------------------------------------------------
-# 1. 侧边栏：AI 模型配置 + 可选备选行情 API（Finnhub）
+# 1. 侧边栏：多服务商与多模型配置（含自定义 OpenAI 兼容接口）
 # ---------------------------------------------------------
 with st.sidebar:
     st.header("AI 模型与 API 配置")
 
     provider = st.selectbox(
         "选择模型服务商",
-        options=["Gemini", "DeepSeek"],
+        options=["Gemini", "DeepSeek", "自定义 OpenAI 兼容接口"],
         index=0,
     )
+
+    custom_base_url = ""
 
     if provider == "Gemini":
         api_key = st.text_input(
@@ -80,7 +82,7 @@ with st.sidebar:
             model_name = selected_gemini
         st.caption("Gemini 适合免费配额轮换与快速批量分析。")
 
-    else:
+    elif provider == "DeepSeek":
         api_key = st.text_input(
             "粘贴你的 DeepSeek API Key",
             type="password",
@@ -104,6 +106,22 @@ with st.sidebar:
         else:
             model_name = selected_deepseek
         st.caption("DeepSeek 走 OpenAI 兼容接口，需确保账户有可用 API 额度。")
+
+    else:
+        custom_base_url = st.text_input(
+            "Base URL（接口根地址）",
+            placeholder="例如：https://api.groq.com/openai/v1 或 https://openrouter.ai/api/v1",
+        )
+        api_key = st.text_input(
+            "粘贴 API Key",
+            type="password",
+            placeholder="填入对应平台的 API Key",
+        )
+        model_name = st.text_input(
+            "输入模型名称（Model ID）",
+            placeholder="例如：llama-3.3-70b-versatile 或免费模型 ID",
+        )
+        st.caption("支持任何遵循 OpenAI `/v1/chat/completions` 规范的接口（含免费额度平台）。")
 
     st.divider()
     st.subheader("可选：备选行情 API")
@@ -250,7 +268,6 @@ def append_tickers_to_input(new_symbols: list[str]) -> None:
 
 
 def _fetch_finnhub_quote(ticker: str, token: str) -> dict:
-    """用 Finnhub /quote 拉取补充报价（主要用于无点号的美股 ticker）。"""
     clean_token = (token or "").strip()
     if not clean_token or "." in ticker:
         return {}
@@ -354,11 +371,18 @@ def build_prompt(metrics: dict) -> str:
 
 
 # ---------------------------------------------------------
-# 4. 统一 AI 调用（Gemini / DeepSeek）
+# 4. 统一 AI 调用（Gemini / DeepSeek / 自定义 OpenAI 兼容接口）
 # ---------------------------------------------------------
-def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -> str:
+def ask_ai_analysis(
+    provider: str,
+    api_key: str,
+    model_name: str,
+    prompt: str,
+    base_url: str = "",
+) -> str:
     clean_key = (api_key or "").strip()
     clean_model = (model_name or "").strip()
+    clean_url = (base_url or "").strip().rstrip("/")
 
     if not clean_key:
         raise ValueError(f"请先在左侧边栏填入 {provider} 的 API Key。")
@@ -377,6 +401,29 @@ def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -
         client = OpenAI(
             api_key=clean_key,
             base_url="https://api.deepseek.com",
+        )
+        response = client.chat.completions.create(
+            model=clean_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是一位严谨的多市场股票估值与排雷分析师，回答客观、简练、不夸大。",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    if provider == "自定义 OpenAI 兼容接口":
+        if not clean_url:
+            raise ValueError("请先在左侧边栏填入 Base URL（例如 https://api.groq.com/openai/v1）。")
+        client = OpenAI(
+            api_key=clean_key,
+            base_url=clean_url,
         )
         response = client.chat.completions.create(
             model=clean_model,
@@ -522,6 +569,7 @@ if start_btn:
                         api_key=api_key,
                         model_name=model_name,
                         prompt=prompt,
+                        base_url=custom_base_url,
                     )
                     reports.append((ticker, name, analysis_text))
                     with st.expander(f"{ticker} — {name}", expanded=True):
