@@ -293,4 +293,4 @@ with st.expander("🔍 用关键字搜公司代码（支持中/英文公司名�
                 except Exception as e:
                     st.error(f"搜索失败：{e}")
 
-    candidates = st.
+   candidates = st.session_state.get("search_candidates", [])
