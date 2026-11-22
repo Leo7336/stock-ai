@@ -169,7 +169,6 @@ def search_companies_by_keyword(keyword: str, max_results: int = 8) -> tuple[lis
         if added and src_label not in sources_used:
             sources_used.append(src_label)
 
-    # 1) 优先用 yf.Search
     try:
         res = yf.Search(query=kw, max_results=max_results)
         quotes = getattr(res, "quotes", None) or []
@@ -187,7 +186,6 @@ def search_companies_by_keyword(keyword: str, max_results: int = 8) -> tuple[lis
     except Exception:
         pass
 
-    # 2) 若结果少于 3 条，补充 HTTP 直连搜索
     if len(items) < 3:
         try:
             http_rows = _http_yahoo_search(kw, max_results=max_results)
@@ -195,7 +193,6 @@ def search_companies_by_keyword(keyword: str, max_results: int = 8) -> tuple[lis
         except Exception:
             pass
 
-    # 3) 常见中英文别名/关键字兜底
     kw_lower = kw.lower()
     alias_rows = []
     for alias_key, tuple_list in ALIAS_HINTS.items():
@@ -239,23 +236,7 @@ def append_tickers_to_input(new_symbols: list[str]) -> None:
     st.session_state["tickers_input"] = ", ".join(current_list[:10])
 
 
-def parse_target_prices(raw_targets: str, count: int) -> list[float | None]:
-    if not raw_targets or not raw_targets.strip():
-        return [None] * count
-    tokens = [x.strip() for x in raw_targets.split(",")]
-    result: list[float | None] = []
-    for i in range(count):
-        if i >= len(tokens) or tokens[i] == "":
-            result.append(None)
-        else:
-            try:
-                result.append(float(tokens[i]))
-            except ValueError:
-                result.append(None)
-    return result
-
-
-def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
+def fetch_stock_metrics(ticker: str) -> dict:
     stock = yf.Ticker(ticker)
     info = stock.info or {}
     hist = stock.history(period="1y")
@@ -273,19 +254,17 @@ def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
     market_cap = info.get("marketCap")
 
     high_52w = info.get("fiftyTwoWeekHigh")
-    if high_52w is None and not hist.empty:
-        high_52w = float(hist["High"].max())
+    low_52w = info.get("fiftyTwoWeekLow")
+    if not hist.empty:
+        if high_52w is None:
+            high_52w = float(hist["High"].max())
+        if low_52w is None:
+            low_52w = float(hist["Low"].min())
 
     drawdown_from_high_pct = None
     if current_price is not None and high_52w and high_52w > 0:
         drawdown_from_high_pct = round(
             (float(current_price) - float(high_52w)) / float(high_52w) * 100, 2
-        )
-
-    margin_of_safety_pct = None
-    if current_price is not None and target_price and target_price > 0:
-        margin_of_safety_pct = round(
-            (float(target_price) - float(current_price)) / float(target_price) * 100, 2
         )
 
     red_flags = []
@@ -303,8 +282,8 @@ def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
         "名称": info.get("shortName") or info.get("longName") or ticker,
         "币种": currency,
         "现价": round(float(current_price), 3) if current_price is not None else None,
-        "5年安全边际目标价": target_price,
-        "距目标价空间(%)": margin_of_safety_pct,
+        "52周最高": round(float(high_52w), 3) if high_52w is not None else None,
+        "52周最低": round(float(low_52w), 3) if low_52w is not None else None,
         "52周高点回撤(%)": drawdown_from_high_pct,
         "PE(TTM)": round(float(pe_ttm), 2) if pe_ttm is not None else None,
         "PB": round(float(pb), 2) if pb is not None else None,
@@ -318,7 +297,7 @@ def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
 
 def build_prompt(metrics: dict) -> str:
     return f"""
-请基于以下股票客观快照，给出简洁、克制、偏重排雷与周期定位的分析（约180~260字，分三点：1. 估值与安全边际；2. 财务与经营排雷；3. 周期与跟踪要点）：
+请基于以下股票客观快照，给出简洁、克制、偏重排雷与周期定位的分析（约180~260字，分三点：1. 估值与区间位置；2. 财务与经营排雷；3. 周期与跟踪要点）：
 
 {metrics}
 """.strip()
@@ -420,11 +399,6 @@ raw_tickers = st.text_area(
     height=90,
 )
 
-raw_targets = st.text_input(
-    '可选：填入对应股票的“5年安全边际目标价”（按顺序用逗号分隔，留空则不计算差距，如：210, 400, 100, 260, , , , 1.50）',
-    value="",
-)
-
 start_btn = st.button("🚀 先出财务简报并开始批量分析", type="primary")
 
 brief_section = st.container()
@@ -436,11 +410,9 @@ if start_btn:
         st.error("请至少输入 1 只有效的股票代码。")
         st.stop()
 
-    targets = parse_target_prices(raw_targets, len(tickers))
     overview_rows = []
     valid_metrics = []
 
-    # 阶段 1：优先抓取客观财务简报与重要指标
     with brief_section:
         st.subheader("1 客观财务简报与重要指标")
         brief_placeholder = st.empty()
@@ -452,7 +424,7 @@ if start_btn:
                 text=f"正在拉取指标 ({idx + 1}/{len(tickers)})：{ticker}",
             )
             try:
-                metrics = fetch_stock_metrics(ticker, targets[idx])
+                metrics = fetch_stock_metrics(ticker)
                 overview_rows.append(metrics)
                 valid_metrics.append(metrics)
             except Exception as e:
@@ -469,7 +441,6 @@ if start_btn:
     st.session_state["metrics_list"] = valid_metrics
     st.session_state["ai_reports"] = []
 
-    # 阶段 2：财务简报出来后，在下方逐只执行 AI 分析
     with ai_section:
         st.subheader(f"2 AI 深度解读（{provider} · {model_name}）")
         if not api_key or not api_key.strip():
