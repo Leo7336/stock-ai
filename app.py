@@ -1,197 +1,375 @@
-import json
 import time
-from concurrent.futures import ThreadPoolExecutor
-from google import genai
-from google.genai import types
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from google import genai
+from openai import OpenAI
 
-st.set_page_config(page_title="5年周期左侧排雷分析器", layout="wide")
-st.title("📊 多市场股票批量排雷与周期分析 (最多10只)")
-
-with st.sidebar:
-    st.header("⚙️ 免费 Gemini API 配置")
-    api_key = st.text_input("粘贴你的 Gemini API Key (AQ... 或 AIza...)", type="password")
-    model_name = st.text_input("模型名称", value="gemini-3.8-flash")
-    st.caption("代码格式：美股 GOOGL | 港股 0981.HK | A股 601985.SS / 002430.SZ | 新加坡 ME8U.SI | 马来 1023.KL | 印尼 BBRI.JK")
-
-default_tickers = "GOOGL, MSFT, NVDA, TSM, 0981.HK, 601985.SS, 9988.HK, ME8U.SI"
-raw_input = st.text_area("输入股票代码（用逗号或换行分隔，最多10只）：", value=default_tickers, height=70)
-
-target_input = st.text_input(
-    "可选：填入对应股票的“5年安全边际目标价”（按顺序用逗号分隔，留空则不计算差距，如：210, 400, 100, 260, , , , 1.50）",
-    value=""
+st.set_page_config(
+    page_title="多市场股票批量排雷与周期分析",
+    page_icon="📊",
+    layout="wide",
 )
 
-def normalize_div_yield(div_yield):
-    if div_yield is None:
-        return None
-    if div_yield > 100:
-        return round(div_yield / 100.0, 2)
-    if div_yield > 15:
-        return round(div_yield, 2)
-    if div_yield <= 0.25:
-        return round(div_yield * 100.0, 2)
-    return round(div_yield, 2)
+DEFAULT_TICKERS = "GOOGL, MSFT, NVDA, TSM, 0981.HK, 601985.SS, 9988.HK, ME8U.SI"
 
-@st.cache_data(ttl=3600)
-def analyze_single_ticker(ticker: str) -> dict:
-    ticker = ticker.strip().upper()
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info or {}
+if "tickers_input" not in st.session_state:
+    st.session_state["tickers_input"] = DEFAULT_TICKERS
+if "search_candidates" not in st.session_state:
+    st.session_state["search_candidates"] = []
 
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        pe_ttm = info.get("trailingPE")
-        pe_fwd = info.get("forwardPE")
-        pb = info.get("priceToBook")
-        div_yield = info.get("dividendYield")
-        roe = info.get("returnOnEquity")
-        debt_to_equity = info.get("debtToEquity")
-        free_cashflow = info.get("freeCashflow")
-        operating_cashflow = info.get("operatingCashflow")
-        revenue_growth = info.get("revenueGrowth")
-        gross_margins = info.get("grossMargins")
 
-        q_bs = stock.quarterly_balance_sheet
-        red_flags = []
+# ---------------------------------------------------------
+# 1. 侧边栏：多服务商与多模型配置
+# ---------------------------------------------------------
+with st.sidebar:
+    st.header("AI 模型与 API 配置")
 
-        if operating_cashflow is not None and operating_cashflow < 0:
-            red_flags.append("经营性现金流为负")
-        if free_cashflow is not None and free_cashflow < 0:
-            red_flags.append("自由现金流为负（注意扩产开支或造血能力）")
+    provider = st.selectbox(
+        "选择模型服务商",
+        options=["Gemini", "DeepSeek"],
+        index=0,
+    )
 
-        sector = info.get("sector", "")
-        if debt_to_equity and debt_to_equity > 150 and "Financial" not in sector and "Real Estate" not in sector:
-            red_flags.append(f"有息负债偏高 (D/E: {debt_to_equity:.1f}%)")
-
-        if q_bs is not None and not q_bs.empty and "Inventory" in q_bs.index:
-            inv_series = q_bs.loc["Inventory"].dropna()
-            if len(inv_series) >= 2 and inv_series.iloc[1] > 0:
-                inv_chg = (inv_series.iloc[0] - inv_series.iloc[1]) / inv_series.iloc[1]
-                if inv_chg > 0.25:
-                    red_flags.append(f"单季存货环比激增 {inv_chg*100:.1f}%")
-
-        return {
-            "代码": ticker,
-            "名称": info.get("shortName", ticker),
-            "币种": info.get("currency", ""),
-            "现价": price,
-            "硬规则排雷": " | ".join(red_flags) if red_flags else "未触发基础红灯",
-            "股息率%": normalize_div_yield(div_yield),
-            "TTM_PE": round(pe_ttm, 2) if pe_ttm else None,
-            "Fwd_PE": round(pe_fwd, 2) if pe_fwd else None,
-            "PB": round(pb, 2) if pb else None,
-            "ROE%": round(roe * 100, 2) if roe else None,
-            "营收增速%": round(revenue_growth * 100, 2) if revenue_growth else None,
-            "毛利率%": round(gross_margins * 100, 2) if gross_margins else None,
-            "52周低点": info.get("fiftyTwoWeekLow"),
-            "52周高点": info.get("fiftyTwoWeekHigh"),
-            "行业": info.get("industry", "")
-        }
-    except Exception as e:
-        return {"代码": ticker, "硬规则排雷": f"抓取异常: {e}"}
-
-def run_llm_single_analysis(stock_item: dict, api_key: str, model: str, max_retries: int = 3) -> dict:
-    client = genai.Client(api_key=api_key)
-
-    system_prompt = """
-你是一名擅长“5年完整产业周期 + 左侧逆向安全边际”的跨市场股票研究员。
-用户会提供单只股票的最新估值与基础财务排雷摘要（JSON格式）。
-请你输出结构化 JSON 分析，严格返回如下格式：
-{
-  "ticker": "股票代码",
-  "valuation_status": "低估 / 合理偏低 / 合理 / 偏高",
-  "cycle_stage": "周期位置（如：景气高位见顶 / 下行去库 / 底部磨底 / 稳健非周期）",
-  "risk_level": "低风险 / 中等观察 / 高警惕",
-  "core_risk_summary": "一句话点出财报或行业最大雷点（如竞争预期突变、重资产折旧、库存积压等）",
-  "five_year_logic": "5年维度的核心护城河与左侧安全边际观察要点（2-3句话）"
-}
-注意：重资产晶圆厂（如中芯国际、意法半导体）重点看PB而非PE；银行和REITs重点看股息率与PB。
-"""
-    last_err = None
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=json.dumps(stock_item, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.2,
-                    response_mime_type="application/json"
-                )
+    if provider == "Gemini":
+        api_key = st.text_input(
+            "粘贴你的 Gemini API Key",
+            type="password",
+            placeholder="AIza... 或 AQ...",
+        )
+        gemini_options = [
+            "gemini-3.8-flash",
+            "gemini-4-hydrogen",
+            "自定义输入...",
+        ]
+        selected_gemini = st.selectbox(
+            "选择 Gemini 模型",
+            options=gemini_options,
+            index=0,
+        )
+        if selected_gemini == "自定义输入...":
+            model_name = st.text_input(
+                "输入自定义 Gemini 模型名称",
+                value="gemini-4-hydrogen",
             )
-            data = json.loads(response.text)
-            if isinstance(data, dict) and "results" in data and data["results"]:
-                return data["results"][0]
-            return data
-        except Exception as e:
-            last_err = e
-            err_str = str(e)
-            if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str) and attempt < max_retries - 1:
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise last_err
-        
-if st.button("🚀 开始批量分析", type="primary"):
-    tickers = [t.strip() for t in raw_input.replace("\n", ",").split(",") if t.strip()]
-    tickers = list(dict.fromkeys(tickers))[:10]
-
-    raw_targets = [x.strip() for x in target_input.split(",")]
-    targets = []
-    for i in range(len(tickers)):
-        if i < len(raw_targets) and raw_targets[i]:
-            try:
-                targets.append(float(raw_targets[i]))
-            except ValueError:
-                targets.append(None)
         else:
-            targets.append(None)
+            model_name = selected_gemini
+        st.caption("Gemini 适合免费配额轮换与快速批量分析。")
 
-    if not tickers:
-        st.warning("请先输入至少1只股票代码。")
     else:
-        with st.spinner(f"正在并发抓取 {len(tickers)} 只股票的行情与财报..."):
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                raw_results = list(executor.map(analyze_single_ticker, tickers))
-
-        for idx, row in enumerate(raw_results):
-            tgt = targets[idx]
-            cur_price = row.get("现价")
-            if tgt is not None:
-                row["安全边际目标价"] = tgt
-                if cur_price and tgt > 0:
-                    # 负数表示现价还高于目标价多少%，正数表示现价已跌破目标价多少%
-                    gap_pct = ((tgt - cur_price) / cur_price) * 100
-                    row["距买点差距%"] = round(gap_pct, 1)
-                else:
-                    row["距买点差距%"] = None
-
-        st.subheader("1️⃣ 客观估值与硬规则排雷总览")
-        st.dataframe(pd.DataFrame(raw_results), use_container_width=True)
-
-        if api_key:
-            st.subheader("2️⃣ AI 周期位置与 5 年安全边际研判")
-            progress_bar = st.progress(0)
-            total_n = len(raw_results)
-
-            for idx, item_data in enumerate(raw_results):
-                t_code = item_data.get("代码", f"第{idx+1}只")
-                with st.spinner(f"正在分析 {t_code} ({idx+1}/{total_n})..."):
-                    try:
-                        ai_item = run_llm_single_analysis(item_data, api_key, model_name)
-                        with st.expander(
-                            f"📌 {ai_item.get('ticker', t_code)} | 估值：{ai_item.get('valuation_status', '-')} | 周期：{ai_item.get('cycle_stage', '-')} | 风险：{ai_item.get('risk_level', '-')}",
-                            expanded=True
-                        ):
-                            st.markdown(f"**⚠️ 核心风险/雷点**：{ai_item.get('core_risk_summary', '')}")
-                            st.markdown(f"**🛡️ 5年周期与安全边际逻辑**：{ai_item.get('five_year_logic', '')}")
-                    except Exception as e:
-                        st.warning(f"⚠️ {t_code} 暂时遇到服务端拥挤（503/限流），本次跳过：{e}")
-
-                progress_bar.progress((idx + 1) / total_n)
-                if idx < total_n - 1:
-                    time.sleep(1.0)
+        api_key = st.text_input(
+            "粘贴你的 DeepSeek API Key",
+            type="password",
+            placeholder="sk-...",
+        )
+        deepseek_options = [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "自定义输入...",
+        ]
+        selected_deepseek = st.selectbox(
+            "选择 DeepSeek 模型",
+            options=deepseek_options,
+            index=0,
+        )
+        if selected_deepseek == "自定义输入...":
+            model_name = st.text_input(
+                "输入自定义 DeepSeek 模型名称",
+                value="deepseek-chat",
+            )
         else:
-            st.info("💡 在左侧边栏粘贴你的 Gemini API Key 后，即可生成下方的 AI 深度排雷结论。")
+            model_name = selected_deepseek
+        st.caption("DeepSeek 走 OpenAI 兼容接口，需确保账户有可用 API 额度。")
+
+    st.divider()
+    st.caption(
+        "代码格式：美股 GOOGL | 港股 0981.HK | A股 601985.SS / 002430.SZ | "
+        "新加坡 ME8U.SI | 马来 1023.KL | 印尼 BBRI.JK"
+    )
+
+
+# ---------------------------------------------------------
+# 2. 关键字搜公司代码 & 市场行情拉取
+# ---------------------------------------------------------
+def search_companies_by_keyword(keyword: str, max_results: int = 8) -> list[dict]:
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    res = yf.Search(query=kw, max_results=max_results)
+    quotes = getattr(res, "quotes", None) or []
+    items = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        name = q.get("shortname") or q.get("longname") or ""
+        exch = q.get("exchDisp") or q.get("exchange") or ""
+        qtype = q.get("quoteType") or ""
+        items.append({
+            "代码": symbol,
+            "名称": name,
+            "市场/交易所": exch,
+            "类型": qtype,
+        })
+    return items
+
+
+def parse_tickers(raw_text: str, max_count: int = 10) -> list[str]:
+    parts = [t.strip().upper() for t in raw_text.replace("\n", ",").split(",")]
+    cleaned = []
+    for p in parts:
+        if p and p not in cleaned:
+            cleaned.append(p)
+    return cleaned[:max_count]
+
+
+def append_tickers_to_input(new_symbols: list[str]) -> None:
+    current_list = parse_tickers(st.session_state.get("tickers_input", ""), max_count=20)
+    for sym in new_symbols:
+        s = sym.strip().upper()
+        if s and s not in current_list:
+            current_list.append(s)
+    st.session_state["tickers_input"] = ", ".join(current_list[:10])
+
+
+def parse_target_prices(raw_targets: str, count: int) -> list[float | None]:
+    if not raw_targets or not raw_targets.strip():
+        return [None] * count
+    tokens = [x.strip() for x in raw_targets.split(",")]
+    result: list[float | None] = []
+    for i in range(count):
+        if i >= len(tokens) or tokens[i] == "":
+            result.append(None)
+        else:
+            try:
+                result.append(float(tokens[i]))
+            except ValueError:
+                result.append(None)
+    return result
+
+
+def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
+    stock = yf.Ticker(ticker)
+    info = stock.info or {}
+    hist = stock.history(period="1y")
+
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if current_price is None and not hist.empty:
+        current_price = float(hist["Close"].iloc[-1])
+
+    currency = info.get("currency") or ""
+    pe_ttm = info.get("trailingPE")
+    pb = info.get("priceToBook")
+    roe = info.get("returnOnEquity")
+    debt_to_equity = info.get("debtToEquity")
+    free_cashflow = info.get("freeCashflow")
+    market_cap = info.get("marketCap")
+
+    high_52w = info.get("fiftyTwoWeekHigh")
+    low_52w = info.get("fiftyTwoWeekLow")
+    if (high_52w is None or low_52w is None) and not hist.empty:
+        high_52w = float(hist["High"].max())
+        low_52w = float(hist["Low"].min())
+
+    drawdown_from_high_pct = None
+    if current_price is not None and high_52w and high_52w > 0:
+        drawdown_from_high_pct = round(
+            (float(current_price) - float(high_52w)) / float(high_52w) * 100, 2
+        )
+
+    margin_of_safety_pct = None
+    if current_price is not None and target_price and target_price > 0:
+        margin_of_safety_pct = round(
+            (float(target_price) - float(current_price)) / float(target_price) * 100, 2
+        )
+
+    red_flags = []
+    if pe_ttm is not None and pe_ttm < 0:
+        red_flags.append("TTM PE为负(亏损)")
+    if debt_to_equity is not None and debt_to_equity > 200:
+        red_flags.append(f"负债权益比偏高({debt_to_equity:.0f}%)")
+    if free_cashflow is not None and free_cashflow < 0:
+        red_flags.append("自由现金流为负")
+    if roe is not None and roe < 0:
+        red_flags.append("ROE为负")
+
+    return {
+        "股票代码": ticker,
+        "名称": info.get("shortName") or info.get("longName") or ticker,
+        "币种": currency,
+        "现价": round(float(current_price), 3) if current_price is not None else None,
+        "5年安全边际目标价": target_price,
+        "距目标价空间(%)": margin_of_safety_pct,
+        "52周高点回撤(%)": drawdown_from_high_pct,
+        "PE(TTM)": round(float(pe_ttm), 2) if pe_ttm is not None else None,
+        "PB": round(float(pb), 2) if pb is not None else None,
+        "ROE(%)": round(float(roe) * 100, 2) if roe is not None else None,
+        "负债权益比": round(float(debt_to_equity), 1) if debt_to_equity is not None else None,
+        "市值": market_cap,
+        "硬规则排雷": "；".join(red_flags) if red_flags else "无明显硬规则红灯",
+    }
+
+
+def build_prompt(metrics: dict) -> str:
+    return f"""
+请基于以下股票客观快照，给出简洁、克制、偏重排雷与周期定位的分析（约180~260字，分三点：1. 估值与安全边际；2. 财务与经营排雷；3. 周期与跟踪要点）：
+
+{metrics}
+""".strip()
+
+
+# ---------------------------------------------------------
+# 3. 统一 AI 调用（Gemini / DeepSeek）
+# ---------------------------------------------------------
+def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -> str:
+    clean_key = (api_key or "").strip()
+    clean_model = (model_name or "").strip()
+
+    if not clean_key:
+        raise ValueError(f"请先在左侧边栏填入 {provider} 的 API Key。")
+    if not clean_model:
+        raise ValueError("模型名称不能为空。")
+
+    if provider == "Gemini":
+        client = genai.Client(api_key=clean_key)
+        response = client.models.generate_content(
+            model=clean_model,
+            contents=prompt,
+        )
+        return (response.text or "").strip()
+
+    if provider == "DeepSeek":
+        client = OpenAI(
+            api_key=clean_key,
+            base_url="https://api.deepseek.com",
+        )
+        response = client.chat.completions.create(
+            model=clean_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是一位严谨的多市场股票估值与排雷分析师，回答客观、简练、不夸大。",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.2,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    raise ValueError(f"不支持的服务商：{provider}")
+
+
+# ---------------------------------------------------------
+# 4. 主界面：关键字查代码 + 批量排雷分析
+# ---------------------------------------------------------
+st.title("📊 多市场股票批量排雷与周期分析（最多10只）")
+
+with st.expander("🔍 用关键字搜公司代码（支持中/英文公司名或关键词）", expanded=False):
+    col_kw, col_btn = st.columns([4, 1])
+    with col_kw:
+        keyword = st.text_input(
+            "输入公司名或关键字",
+            placeholder="例如：腾讯、Micron、Mapletree、Tenaga、中芯",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        do_search = st.button("搜索代码", use_container_width=True)
+
+    if do_search:
+        if not keyword.strip():
+            st.warning("请先输入关键字。")
+        else:
+            with st.spinner("正在搜索匹配的公司代码..."):
+                try:
+                    st.session_state["search_candidates"] = search_companies_by_keyword(keyword)
+                except Exception as e:
+                    st.error(f"搜索失败：{e}")
+
+    candidates = st.session_state.get("search_candidates", [])
+    if candidates:
+        st.dataframe(pd.DataFrame(candidates), use_container_width=True, hide_index=True)
+        option_labels = [
+            f"{c['代码']} | {c['名称']} ({c['市场/交易所']})" for c in candidates
+        ]
+        label_to_symbol = {
+            option_labels[i]: candidates[i]["代码"] for i in range(len(candidates))
+        }
+        picked_labels = st.multiselect(
+            "勾选要加入分析的代码：",
+            options=option_labels,
+        )
+        if st.button("➕ 加入下方股票代码框"):
+            picked_symbols = [label_to_symbol[lbl] for lbl in picked_labels]
+            if not picked_symbols:
+                st.warning("请先勾选至少 1 个搜索结果。")
+            else:
+                append_tickers_to_input(picked_symbols)
+                st.rerun()
+
+raw_tickers = st.text_area(
+    "输入股票代码（用逗号或换行分隔，最多10只）：",
+    key="tickers_input",
+    height=90,
+)
+
+raw_targets = st.text_input(
+    '可选：填入对应股票的“5年安全边际目标价”（按顺序用逗号分隔，留空则不计算差距，如：210, 400, 100, 260, , , , 1.50）',
+    value="",
+)
+
+start_btn = st.button("🚀 开始批量分析", type="primary")
+
+if start_btn:
+    tickers = parse_tickers(raw_tickers, max_count=10)
+    if not tickers:
+        st.error("请至少输入 1 只有效的股票代码。")
+        st.stop()
+
+    if not api_key or not api_key.strip():
+        st.error(f"请先在左侧边栏填入 {provider} 的 API Key。")
+        st.stop()
+
+    targets = parse_target_prices(raw_targets, len(tickers))
+    overview_rows = []
+    ai_reports = []
+
+    progress_bar = st.progress(0, text="准备开始批量分析...")
+
+    for idx, ticker in enumerate(tickers):
+        progress_bar.progress(
+            idx / len(tickers),
+            text=f"正在分析 ({idx + 1}/{len(tickers)})：{ticker} [{provider} / {model_name}]",
+        )
+        try:
+            metrics = fetch_stock_metrics(ticker, targets[idx])
+            overview_rows.append(metrics)
+
+            prompt = build_prompt(metrics)
+            analysis_text = ask_ai_analysis(
+                provider=provider,
+                api_key=api_key,
+                model_name=model_name,
+                prompt=prompt,
+            )
+            ai_reports.append((ticker, metrics.get("名称", ticker), analysis_text))
+
+        except Exception as e:
+            st.warning(f"{ticker} 处理失败，已跳过：{e}")
+            overview_rows.append({"股票代码": ticker, "硬规则排雷": f"抓取/分析异常：{e}"})
+
+        if idx < len(tickers) - 1:
+            time.sleep(1.0)
+
+    progress_bar.progress(1.0, text="批量分析完成。")
+
+    st.subheader("1 客观估值与硬规则排雷总览")
+    df_overview = pd.DataFrame(overview_rows)
+    st.dataframe(df_overview, use_container_width=True)
+
+    st.subheader(f"2 AI 逐只解读（{provider} · {model_name}）")
+    for ticker, name, text in ai_reports:
+        with st.expander(f"{ticker} — {name}", expanded=True):
+            st.markdown(text)
