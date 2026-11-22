@@ -1,4 +1,7 @@
+import json
 import time
+import urllib.parse
+import urllib.request
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -13,10 +16,25 @@ st.set_page_config(
 
 DEFAULT_TICKERS = "GOOGL, MSFT, NVDA, TSM, 0981.HK, 601985.SS, 9988.HK, ME8U.SI"
 
+ALIAS_HINTS = {
+    "micron": [("MU", "Micron Technology, Inc.", "NASDAQ", "EQUITY")],
+    "美光": [("MU", "Micron Technology, Inc.", "NASDAQ", "EQUITY")],
+    "腾讯": [("0700.HK", "Tencent Holdings Ltd.", "Hong Kong", "EQUITY"), ("TCEHY", "Tencent Holdings Ltd.", "OTC", "EQUITY")],
+    "阿里": [("9988.HK", "Alibaba Group Holding Ltd.", "Hong Kong", "EQUITY"), ("BABA", "Alibaba Group Holding Ltd.", "NYSE", "EQUITY")],
+    "中芯": [("0981.HK", "SMIC", "Hong Kong", "EQUITY"), ("688981.SS", "SMIC", "Shanghai", "EQUITY")],
+    "台积电": [("TSM", "Taiwan Semiconductor Manufacturing", "NYSE", "EQUITY"), ("2330.TW", "TSMC", "Taiwan", "EQUITY")],
+    "英伟达": [("NVDA", "NVIDIA Corporation", "NASDAQ", "EQUITY")],
+    "谷歌": [("GOOGL", "Alphabet Inc.", "NASDAQ", "EQUITY")],
+    "微软": [("MSFT", "Microsoft Corporation", "NASDAQ", "EQUITY")],
+    "意法": [("STM", "STMicroelectronics N.V.", "NYSE", "EQUITY")],
+}
+
 if "tickers_input" not in st.session_state:
     st.session_state["tickers_input"] = DEFAULT_TICKERS
 if "search_candidates" not in st.session_state:
     st.session_state["search_candidates"] = []
+if "search_status" not in st.session_state:
+    st.session_state["search_status"] = ""
 if "brief_df" not in st.session_state:
     st.session_state["brief_df"] = None
 if "metrics_list" not in st.session_state:
@@ -95,31 +113,114 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------
-# 2. 关键字搜公司代码 & 市场行情拉取
+# 2. 关键字搜公司代码（yf.Search + HTTP 备选 + 别名兜底）
 # ---------------------------------------------------------
-def search_companies_by_keyword(keyword: str, max_results: int = 8) -> list[dict]:
-    kw = (keyword or "").strip()
-    if not kw:
-        return []
-    res = yf.Search(query=kw, max_results=max_results)
-    quotes = getattr(res, "quotes", None) or []
+def _http_yahoo_search(kw: str, max_results: int = 8) -> list[dict]:
+    url = (
+        "https://query2.finance.yahoo.com/v1/finance/search?q="
+        + urllib.parse.quote(kw)
+        + f"&quotesCount={max_results}&newsCount=0"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    quotes = data.get("quotes") or []
     items = []
     for q in quotes:
         symbol = q.get("symbol")
         if not symbol:
             continue
-        name = q.get("shortname") or q.get("longname") or ""
-        exch = q.get("exchDisp") or q.get("exchange") or ""
-        qtype = q.get("quoteType") or ""
         items.append({
             "代码": symbol,
-            "名称": name,
-            "市场/交易所": exch,
-            "类型": qtype,
+            "名称": q.get("shortname") or q.get("longname") or "",
+            "市场/交易所": q.get("exchDisp") or q.get("exchange") or "",
+            "类型": q.get("quoteType") or "",
         })
     return items
 
 
+def search_companies_by_keyword(keyword: str, max_results: int = 8) -> tuple[list[dict], str]:
+    kw = (keyword or "").strip()
+    if not kw:
+        return [], "请输入关键字。"
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    sources_used: list[str] = []
+
+    def add_rows(rows: list[dict], src_label: str) -> None:
+        added = False
+        for r in rows:
+            sym = (r.get("代码") or "").strip().upper()
+            if sym and sym not in seen:
+                seen.add(sym)
+                items.append({
+                    "代码": sym,
+                    "名称": r.get("名称") or "",
+                    "市场/交易所": r.get("市场/交易所") or "",
+                    "类型": r.get("类型") or "",
+                })
+                added = True
+        if added and src_label not in sources_used:
+            sources_used.append(src_label)
+
+    # 1) 优先用 yf.Search
+    try:
+        res = yf.Search(query=kw, max_results=max_results)
+        quotes = getattr(res, "quotes", None) or []
+        yf_rows = [
+            {
+                "代码": q.get("symbol"),
+                "名称": q.get("shortname") or q.get("longname") or "",
+                "市场/交易所": q.get("exchDisp") or q.get("exchange") or "",
+                "类型": q.get("quoteType") or "",
+            }
+            for q in quotes
+            if q.get("symbol")
+        ]
+        add_rows(yf_rows, "yf.Search")
+    except Exception:
+        pass
+
+    # 2) 若结果少于 3 条，补充 HTTP 直连搜索
+    if len(items) < 3:
+        try:
+            http_rows = _http_yahoo_search(kw, max_results=max_results)
+            add_rows(http_rows, "Yahoo直连")
+        except Exception:
+            pass
+
+    # 3) 常见中英文别名/关键字兜底
+    kw_lower = kw.lower()
+    alias_rows = []
+    for alias_key, tuple_list in ALIAS_HINTS.items():
+        if alias_key in kw_lower or kw_lower in alias_key:
+            for sym, nm, exch, qt in tuple_list:
+                alias_rows.append({
+                    "代码": sym,
+                    "名称": nm,
+                    "市场/交易所": exch,
+                    "类型": qt,
+                })
+    if alias_rows:
+        add_rows(alias_rows, "常用映射")
+
+    final_items = items[:max_results]
+    if not final_items:
+        return [], f"未搜到“{kw}”的匹配结果，可尝试英文名或直接在下方输入代码。"
+
+    src_text = " / ".join(sources_used) if sources_used else "默认"
+    return final_items, f"已找到 {len(final_items)} 条结果（来源：{src_text}）"
+
+
+# ---------------------------------------------------------
+# 3. 股票代码解析、行情指标与排雷计算
+# ---------------------------------------------------------
 def parse_tickers(raw_text: str, max_count: int = 10) -> list[str]:
     parts = [t.strip().upper() for t in raw_text.replace("\n", ",").split(",")]
     cleaned = []
@@ -224,7 +325,7 @@ def build_prompt(metrics: dict) -> str:
 
 
 # ---------------------------------------------------------
-# 3. 统一 AI 调用（Gemini / DeepSeek）
+# 4. 统一 AI 调用（Gemini / DeepSeek）
 # ---------------------------------------------------------
 def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -> str:
     clean_key = (api_key or "").strip()
@@ -268,29 +369,155 @@ def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -
 
 
 # ---------------------------------------------------------
-# 4. 主界面：关键字查代码 + 先出财务简报 + 后跑 AI 分析
+# 5. 主界面：关键字查代码 + 先出财务简报 + 后跑 AI 分析
 # ---------------------------------------------------------
 st.title("📊 多市场股票批量排雷与周期分析（最多10只）")
 
-with st.expander("🔍 用关键字搜公司代码（支持中/英文公司名或关键词）", expanded=False):
+with st.expander("🔍 用关键字搜公司代码（支持中/英文公司名或关键词）", expanded=True):
     col_kw, col_btn = st.columns([4, 1])
     with col_kw:
         keyword = st.text_input(
             "输入公司名或关键字",
-            placeholder="例如：腾讯、Micron、Mapletree、Tenaga、中芯",
+            placeholder="例如：micron、腾讯、Mapletree、中芯",
             label_visibility="collapsed",
         )
     with col_btn:
         do_search = st.button("搜索代码", use_container_width=True)
 
     if do_search:
-        if not keyword.strip():
-            st.warning("请先输入关键字。")
-        else:
-            with st.spinner("正在搜索匹配的公司代码..."):
-                try:
-                    st.session_state["search_candidates"] = search_companies_by_keyword(keyword)
-                except Exception as e:
-                    st.error(f"搜索失败：{e}")
+        with st.spinner("正在搜索匹配的公司代码..."):
+            rows, status_msg = search_companies_by_keyword(keyword, max_results=8)
+            st.session_state["search_candidates"] = rows
+            st.session_state["search_status"] = status_msg
+
+    if st.session_state.get("search_status"):
+        st.caption(st.session_state["search_status"])
 
     candidates = st.session_state.get("search_candidates", [])
+    if candidates:
+        st.dataframe(pd.DataFrame(candidates), use_container_width=True, hide_index=True)
+        option_labels = [
+            f"{c['代码']} | {c['名称']} ({c['市场/交易所']})" for c in candidates
+        ]
+        label_to_symbol = {
+            option_labels[i]: candidates[i]["代码"] for i in range(len(candidates))
+        }
+        picked_labels = st.multiselect(
+            "勾选要加入分析的代码：",
+            options=option_labels,
+        )
+        if st.button("➕ 加入下方股票代码框"):
+            picked_symbols = [label_to_symbol[lbl] for lbl in picked_labels]
+            if not picked_symbols:
+                st.warning("请先勾选至少 1 个搜索结果。")
+            else:
+                append_tickers_to_input(picked_symbols)
+                st.rerun()
+
+raw_tickers = st.text_area(
+    "输入股票代码（用逗号或换行分隔，最多10只）：",
+    key="tickers_input",
+    height=90,
+)
+
+raw_targets = st.text_input(
+    '可选：填入对应股票的“5年安全边际目标价”（按顺序用逗号分隔，留空则不计算差距，如：210, 400, 100, 260, , , , 1.50）',
+    value="",
+)
+
+start_btn = st.button("🚀 先出财务简报并开始批量分析", type="primary")
+
+brief_section = st.container()
+ai_section = st.container()
+
+if start_btn:
+    tickers = parse_tickers(raw_tickers, max_count=10)
+    if not tickers:
+        st.error("请至少输入 1 只有效的股票代码。")
+        st.stop()
+
+    targets = parse_target_prices(raw_targets, len(tickers))
+    overview_rows = []
+    valid_metrics = []
+
+    # 阶段 1：优先抓取客观财务简报与重要指标
+    with brief_section:
+        st.subheader("1 客观财务简报与重要指标")
+        brief_placeholder = st.empty()
+        brief_progress = st.progress(0, text="正在拉取财务简报与核心指标...")
+
+        for idx, ticker in enumerate(tickers):
+            brief_progress.progress(
+                idx / len(tickers),
+                text=f"正在拉取指标 ({idx + 1}/{len(tickers)})：{ticker}",
+            )
+            try:
+                metrics = fetch_stock_metrics(ticker, targets[idx])
+                overview_rows.append(metrics)
+                valid_metrics.append(metrics)
+            except Exception as e:
+                overview_rows.append({
+                    "股票代码": ticker,
+                    "硬规则排雷": f"行情/财务拉取异常：{e}",
+                })
+
+            brief_placeholder.dataframe(pd.DataFrame(overview_rows), use_container_width=True)
+
+        brief_progress.progress(1.0, text="财务简报已就绪。")
+
+    st.session_state["brief_df"] = pd.DataFrame(overview_rows)
+    st.session_state["metrics_list"] = valid_metrics
+    st.session_state["ai_reports"] = []
+
+    # 阶段 2：财务简报出来后，在下方逐只执行 AI 分析
+    with ai_section:
+        st.subheader(f"2 AI 深度解读（{provider} · {model_name}）")
+        if not api_key or not api_key.strip():
+            st.info(
+                f"上方财务简报已生成。若需生成 AI 解读，请在左侧边栏填入 {provider} 的 API Key 后重新点击按钮。"
+            )
+        elif not valid_metrics:
+            st.warning("没有可用的股票财务快照，跳过 AI 分析。")
+        else:
+            ai_progress = st.progress(0, text="财务简报已出，开始后台逐只 AI 分析...")
+            reports = []
+
+            for idx, metrics in enumerate(valid_metrics):
+                ticker = metrics["股票代码"]
+                name = metrics.get("名称", ticker)
+                ai_progress.progress(
+                    idx / len(valid_metrics),
+                    text=f"正在 AI 分析 ({idx + 1}/{len(valid_metrics)})：{ticker} [{provider} / {model_name}]",
+                )
+                try:
+                    prompt = build_prompt(metrics)
+                    analysis_text = ask_ai_analysis(
+                        provider=provider,
+                        api_key=api_key,
+                        model_name=model_name,
+                        prompt=prompt,
+                    )
+                    reports.append((ticker, name, analysis_text))
+                    with st.expander(f"{ticker} — {name}", expanded=True):
+                        st.markdown(analysis_text)
+                except Exception as e:
+                    st.warning(f"{ticker} AI 分析跳过：{e}")
+
+                if idx < len(valid_metrics) - 1:
+                    time.sleep(1.0)
+
+            ai_progress.progress(1.0, text="AI 批量分析完成。")
+            st.session_state["ai_reports"] = reports
+
+else:
+    if st.session_state.get("brief_df") is not None:
+        with brief_section:
+            st.subheader("1 客观财务简报与重要指标")
+            st.dataframe(st.session_state["brief_df"], use_container_width=True)
+
+    if st.session_state.get("ai_reports"):
+        with ai_section:
+            st.subheader(f"2 AI 深度解读（{provider} · {model_name}）")
+            for ticker, name, text in st.session_state["ai_reports"]:
+                with st.expander(f"{ticker} — {name}", expanded=True):
+                    st.markdown(text)
