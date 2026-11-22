@@ -17,6 +17,12 @@ if "tickers_input" not in st.session_state:
     st.session_state["tickers_input"] = DEFAULT_TICKERS
 if "search_candidates" not in st.session_state:
     st.session_state["search_candidates"] = []
+if "brief_df" not in st.session_state:
+    st.session_state["brief_df"] = None
+if "metrics_list" not in st.session_state:
+    st.session_state["metrics_list"] = []
+if "ai_reports" not in st.session_state:
+    st.session_state["ai_reports"] = []
 
 
 # ---------------------------------------------------------
@@ -166,10 +172,8 @@ def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
     market_cap = info.get("marketCap")
 
     high_52w = info.get("fiftyTwoWeekHigh")
-    low_52w = info.get("fiftyTwoWeekLow")
-    if (high_52w is None or low_52w is None) and not hist.empty:
+    if high_52w is None and not hist.empty:
         high_52w = float(hist["High"].max())
-        low_52w = float(hist["Low"].min())
 
     drawdown_from_high_pct = None
     if current_price is not None and high_52w and high_52w > 0:
@@ -205,6 +209,7 @@ def fetch_stock_metrics(ticker: str, target_price: float | None) -> dict:
         "PB": round(float(pb), 2) if pb is not None else None,
         "ROE(%)": round(float(roe) * 100, 2) if roe is not None else None,
         "负债权益比": round(float(debt_to_equity), 1) if debt_to_equity is not None else None,
+        "自由现金流": free_cashflow,
         "市值": market_cap,
         "硬规则排雷": "；".join(red_flags) if red_flags else "无明显硬规则红灯",
     }
@@ -263,7 +268,7 @@ def ask_ai_analysis(provider: str, api_key: str, model_name: str, prompt: str) -
 
 
 # ---------------------------------------------------------
-# 4. 主界面：关键字查代码 + 批量排雷分析
+# 4. 主界面：关键字查代码 + 先出财务简报 + 后跑 AI 分析
 # ---------------------------------------------------------
 st.title("📊 多市场股票批量排雷与周期分析（最多10只）")
 
@@ -288,88 +293,4 @@ with st.expander("🔍 用关键字搜公司代码（支持中/英文公司名�
                 except Exception as e:
                     st.error(f"搜索失败：{e}")
 
-    candidates = st.session_state.get("search_candidates", [])
-    if candidates:
-        st.dataframe(pd.DataFrame(candidates), use_container_width=True, hide_index=True)
-        option_labels = [
-            f"{c['代码']} | {c['名称']} ({c['市场/交易所']})" for c in candidates
-        ]
-        label_to_symbol = {
-            option_labels[i]: candidates[i]["代码"] for i in range(len(candidates))
-        }
-        picked_labels = st.multiselect(
-            "勾选要加入分析的代码：",
-            options=option_labels,
-        )
-        if st.button("➕ 加入下方股票代码框"):
-            picked_symbols = [label_to_symbol[lbl] for lbl in picked_labels]
-            if not picked_symbols:
-                st.warning("请先勾选至少 1 个搜索结果。")
-            else:
-                append_tickers_to_input(picked_symbols)
-                st.rerun()
-
-raw_tickers = st.text_area(
-    "输入股票代码（用逗号或换行分隔，最多10只）：",
-    key="tickers_input",
-    height=90,
-)
-
-raw_targets = st.text_input(
-    '可选：填入对应股票的“5年安全边际目标价”（按顺序用逗号分隔，留空则不计算差距，如：210, 400, 100, 260, , , , 1.50）',
-    value="",
-)
-
-start_btn = st.button("🚀 开始批量分析", type="primary")
-
-if start_btn:
-    tickers = parse_tickers(raw_tickers, max_count=10)
-    if not tickers:
-        st.error("请至少输入 1 只有效的股票代码。")
-        st.stop()
-
-    if not api_key or not api_key.strip():
-        st.error(f"请先在左侧边栏填入 {provider} 的 API Key。")
-        st.stop()
-
-    targets = parse_target_prices(raw_targets, len(tickers))
-    overview_rows = []
-    ai_reports = []
-
-    progress_bar = st.progress(0, text="准备开始批量分析...")
-
-    for idx, ticker in enumerate(tickers):
-        progress_bar.progress(
-            idx / len(tickers),
-            text=f"正在分析 ({idx + 1}/{len(tickers)})：{ticker} [{provider} / {model_name}]",
-        )
-        try:
-            metrics = fetch_stock_metrics(ticker, targets[idx])
-            overview_rows.append(metrics)
-
-            prompt = build_prompt(metrics)
-            analysis_text = ask_ai_analysis(
-                provider=provider,
-                api_key=api_key,
-                model_name=model_name,
-                prompt=prompt,
-            )
-            ai_reports.append((ticker, metrics.get("名称", ticker), analysis_text))
-
-        except Exception as e:
-            st.warning(f"{ticker} 处理失败，已跳过：{e}")
-            overview_rows.append({"股票代码": ticker, "硬规则排雷": f"抓取/分析异常：{e}"})
-
-        if idx < len(tickers) - 1:
-            time.sleep(1.0)
-
-    progress_bar.progress(1.0, text="批量分析完成。")
-
-    st.subheader("1 客观估值与硬规则排雷总览")
-    df_overview = pd.DataFrame(overview_rows)
-    st.dataframe(df_overview, use_container_width=True)
-
-    st.subheader(f"2 AI 逐只解读（{provider} · {model_name}）")
-    for ticker, name, text in ai_reports:
-        with st.expander(f"{ticker} — {name}", expanded=True):
-            st.markdown(text)
+    candidates = st.
